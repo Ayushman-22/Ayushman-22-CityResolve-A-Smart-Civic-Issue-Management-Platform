@@ -11,6 +11,15 @@ interface SuggestRequest {
   photoData?: string | null;
 }
 
+interface GeminiPart {
+  text?: string;
+}
+
+interface GeminiResponse {
+  candidates?: Array<{ content?: { parts?: GeminiPart[] } }>;
+  error?: { message?: string };
+}
+
 const CATEGORY_KEYWORDS: Record<string, string[]> = {
   Pothole: ["pothole", "road", "crack", "asphalt", "ditch", "speed bump", "manhole"],
   Streetlight: ["streetlight", "street light", "lamp", "light", "dark", "flicker", "pole"],
@@ -78,6 +87,27 @@ function parseModelResult(content: string): Record<string, unknown> {
   return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : {};
 }
 
+function photoPart(photoData: string) {
+  const match = photoData.match(/^data:([^;]+);base64,(.+)$/);
+  if (!match) throw new Error("The uploaded image could not be prepared for Gemini");
+  return { inlineData: { mimeType: match[1], data: match[2] } };
+}
+
+const responseSchema = {
+  type: "OBJECT",
+  properties: {
+    title: { type: "STRING", nullable: true },
+    description: { type: "STRING", nullable: true },
+    category: { type: "STRING" },
+    priority: { type: "STRING" },
+    location: { type: "STRING", nullable: true },
+    ward: { type: "STRING", nullable: true },
+    reason: { type: "STRING", nullable: true },
+    recommendedAction: { type: "STRING", nullable: true },
+  },
+  required: ["title", "description", "category", "priority", "location", "ward", "reason", "recommendedAction"],
+};
+
 Deno.serve(async (req: Request) => {
   if (req.method === "OPTIONS") {
     return new Response(null, { status: 200, headers: corsHeaders });
@@ -98,39 +128,43 @@ Deno.serve(async (req: Request) => {
       ward: null,
     };
 
-    const openAiKey = Deno.env.get("OPENAI_API_KEY");
-    if (!openAiKey || openAiKey === "your_openai_key") {
-      return jsonResponse({ error: "AI is not configured. Add OPENAI_API_KEY to the Supabase function secrets." }, 503);
+    const geminiApiKey = Deno.env.get("GEMINI_API_KEY");
+    if (!geminiApiKey || geminiApiKey === "your_gemini_api_key") {
+      return jsonResponse({ error: "AI is not configured. Add GEMINI_API_KEY to the Supabase function secrets." }, 503);
     }
 
-    const aiResponse = await fetch("https://api.openai.com/v1/chat/completions", {
+    // Gemini has retired gemini-2.5-flash for new API keys. Pin the currently
+    // available Flash model instead of relying on a stale GEMINI_MODEL secret.
+    const model = "gemini-3.6-flash";
+    const aiResponse = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${geminiApiKey}`, {
       method: "POST",
-      headers: { "Content-Type": "application/json", Authorization: `Bearer ${openAiKey}` },
+      headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        model: "gpt-4o-mini",
-        response_format: { type: "json_object" },
-        messages: [{
+        contents: [{
           role: "user",
-          content: [
+          parts: [
             {
-              type: "text",
-              text: `Analyze this civic issue${photoData ? " photo" : " description"}${description ? ` and the user's note: ${description}` : ""}. Return JSON with exactly these keys: title, description, category, priority, location, ward, reason, recommendedAction. Use category from ${Object.keys(CATEGORY_KEYWORDS).join(", ")} or Other. Use priority low, medium, high, or urgent. Write a concise title and useful description. Explain the classification briefly in reason and suggest one practical municipal action. Set location or ward to null unless clearly readable. Do not invent facts.`,
+              text: `Analyze this civic issue${photoData ? " photo" : " description"}${description ? ` and the user's note: ${description}` : ""}. Use category from ${Object.keys(CATEGORY_KEYWORDS).join(", ")} or Other. Use priority low, medium, high, or urgent. Write a concise title and useful description. Explain the classification briefly in reason and suggest one practical municipal action. Set location or ward to null unless clearly readable. Do not invent facts.`,
             },
-            ...(photoData ? [{ type: "image_url", image_url: { url: photoData } }] : []),
+            ...(photoData ? [photoPart(photoData)] : []),
           ],
         }],
+        generationConfig: {
+          responseMimeType: "application/json",
+          responseSchema,
+        },
       }),
     });
     if (!aiResponse.ok) {
-      const failure = await aiResponse.json().catch(() => null);
-      const message = failure?.error?.message || `OpenAI request failed (${aiResponse.status})`;
+      const failure = await aiResponse.json().catch(() => null) as GeminiResponse | null;
+      const message = failure?.error?.message || `Gemini request failed (${aiResponse.status})`;
       return jsonResponse({ error: message }, 502);
     }
 
-    const payload = await aiResponse.json();
-    const content = payload.choices?.[0]?.message?.content;
+    const payload = await aiResponse.json() as GeminiResponse;
+    const content = payload.candidates?.[0]?.content?.parts?.map((part) => part.text || "").join("");
     if (!content) {
-      return jsonResponse({ error: "OpenAI returned an empty suggestion" }, 502);
+      return jsonResponse({ error: "Gemini returned an empty suggestion" }, 502);
     }
 
     const aiResult = parseModelResult(content);
