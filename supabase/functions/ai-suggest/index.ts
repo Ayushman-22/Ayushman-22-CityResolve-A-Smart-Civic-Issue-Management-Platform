@@ -3,7 +3,8 @@ import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Methods": "POST, OPTIONS",
-  "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Client-Info, Apikey",
+  "Access-Control-Allow-Headers":
+    "Content-Type, Authorization, X-Client-Info, Apikey",
 };
 
 interface SuggestRequest {
@@ -12,139 +13,403 @@ interface SuggestRequest {
 }
 
 const CATEGORY_KEYWORDS: Record<string, string[]> = {
-  Pothole: ["pothole", "road", "crack", "asphalt", "ditch", "speed bump", "manhole"],
-  Streetlight: ["streetlight", "street light", "lamp", "light", "dark", "flicker", "pole"],
-  Garbage: ["garbage", "trash", "waste", "rubbish", "dump", "bin", "litter", "smell"],
-  Water: ["water", "leak", "pipe", "drainage", "flood", "sewage", "tap", "sewer"],
-  Electricity: ["electric", "power", "wire", "transformer", "outage", "voltage", "meter"],
-  Parking: ["parking", "vehicle", "car", "tow", "no parking", "illegal"],
-  Trees: ["tree", "branch", "fallen", "garden", "park", "trim", "uprooted"],
-  Noise: ["noise", "loud", "music", "construction", "honk", "party"],
-  Animals: ["dog", "stray", "animal", "cattle", "monkey", "pest"],
-  Sanitation: ["toilet", "urinal", "sanitation", "hygiene", "public toilet"],
+  Pothole: ["pothole", "road", "crack", "asphalt", "ditch", "manhole"],
+  Streetlight: ["streetlight", "lamp", "light", "dark", "flicker", "pole"],
+  Garbage: ["garbage", "trash", "waste", "dump", "bin", "litter"],
+  Water: ["water", "leak", "pipe", "drainage", "flood", "sewage"],
+  Electricity: ["electric", "power", "wire", "transformer", "outage"],
+  Parking: ["parking", "vehicle", "car", "illegal"],
+  Trees: ["tree", "branch", "fallen", "park", "trim"],
+  Noise: ["noise", "loud", "music", "construction"],
+  Animals: ["dog", "stray", "animal", "cattle"],
+  Sanitation: ["toilet", "sanitation", "hygiene"],
 };
 
-const PRIORITY_KEYWORDS: { keywords: string[]; priority: string }[] = [
-  { keywords: ["urgent", "emergency", "danger", "accident", "fire", "collapse", "electrocution", "flood", "injury"], priority: "urgent" },
-  { keywords: ["broken", "damaged", "leak", "large", "major", "blocking", "severe", "heavy"], priority: "high" },
-  { keywords: ["minor", "small", "slight", "occasionally", "sometimes"], priority: "low" },
+const PRIORITY_KEYWORDS = [
+  {
+    keywords: ["urgent", "danger", "fire", "accident", "collapse", "flood", "injury"],
+    priority: "urgent",
+  },
+  {
+    keywords: ["broken", "damaged", "leak", "major", "blocking", "severe"],
+    priority: "high",
+  },
+  {
+    keywords: ["minor", "small", "slight"],
+    priority: "low",
+  },
 ];
 
-function suggestCategory(description: string): string {
+
+function suggestCategory(description: string) {
   const lower = description.toLowerCase();
+
   let best = "Other";
-  let bestScore = 0;
-  for (const [cat, words] of Object.entries(CATEGORY_KEYWORDS)) {
-    let score = 0;
-    for (const w of words) {
-      if (lower.includes(w)) score += 1;
+  let score = 0;
+
+  for (const [category, words] of Object.entries(CATEGORY_KEYWORDS)) {
+
+    let count = 0;
+
+    for (const word of words) {
+      if (lower.includes(word)) count++;
     }
-    if (score > bestScore) {
-      bestScore = score;
-      best = cat;
+
+    if (count > score) {
+      score = count;
+      best = category;
     }
   }
+
   return best;
 }
 
-function suggestPriority(description: string): string {
+
+function suggestPriority(description: string) {
+
   const lower = description.toLowerCase();
-  for (const { keywords, priority } of PRIORITY_KEYWORDS) {
-    for (const kw of keywords) {
-      if (lower.includes(kw)) return priority;
+
+  for (const item of PRIORITY_KEYWORDS) {
+
+    for (const word of item.keywords) {
+
+      if (lower.includes(word)) {
+        return item.priority;
+      }
+
     }
+
   }
+
   return "medium";
 }
 
-function isCategory(value: unknown): value is string {
-  return typeof value === "string" && [...Object.keys(CATEGORY_KEYWORDS), "Other"].includes(value);
+
+function isCategory(value: unknown) {
+
+  return (
+    typeof value === "string" &&
+    [...Object.keys(CATEGORY_KEYWORDS), "Other"].includes(value)
+  );
+
 }
 
-function isPriority(value: unknown): value is string {
-  return typeof value === "string" && ["low", "medium", "high", "urgent"].includes(value);
+
+function isPriority(value: unknown) {
+
+  return (
+    typeof value === "string" &&
+    ["low", "medium", "high", "urgent"].includes(value)
+  );
+
 }
 
-function jsonResponse(body: Record<string, unknown>, status = 200) {
-  return new Response(JSON.stringify(body), {
-    status,
-    headers: { ...corsHeaders, "Content-Type": "application/json" },
-  });
+
+function jsonResponse(
+  body: Record<string, unknown>,
+  status = 200
+) {
+
+  return new Response(
+    JSON.stringify(body),
+    {
+      status,
+      headers:{
+        ...corsHeaders,
+        "Content-Type":"application/json"
+      }
+    }
+  );
+
 }
 
-function parseModelResult(content: string): Record<string, unknown> {
-  const normalized = content.trim().replace(/^```(?:json)?\s*|\s*```$/gi, "");
-  const parsed = JSON.parse(normalized) as Record<string, unknown>;
-  return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : {};
-}
 
-Deno.serve(async (req: Request) => {
-  if (req.method === "OPTIONS") {
-    return new Response(null, { status: 200, headers: corsHeaders });
+function parseJSON(text:string){
+
+  const cleaned = text
+    .replace(/```json/g,"")
+    .replace(/```/g,"")
+    .trim();
+
+
+  try{
+    return JSON.parse(cleaned);
+  }
+  catch{
+    return {};
   }
 
-  try {
-    const { description = "", photoData = null } = (await req.json()) as SuggestRequest;
-    if (!description && !photoData) {
-      return jsonResponse({ error: "Description or photo is required" }, 400);
+}
+
+
+
+Deno.serve(async(req)=>{
+
+  if(req.method==="OPTIONS"){
+
+    return new Response(null,{
+      status:200,
+      headers:corsHeaders
+    });
+
+  }
+
+
+  try{
+
+
+    const {
+      description="",
+      photoData=null
+    } = await req.json() as SuggestRequest;
+
+
+
+    if(!description && !photoData){
+
+      return jsonResponse(
+        {
+          error:"Description or photo required"
+        },
+        400
+      );
+
     }
 
-    let result: Record<string, string | null> = {
-      category: suggestCategory(description),
-      priority: suggestPriority(description),
-      title: null,
-      description: null,
-      location: null,
-      ward: null,
+
+
+    let result:any={
+
+      title:null,
+      description:null,
+      category:suggestCategory(description),
+      priority:suggestPriority(description),
+      location:null,
+      ward:null,
+      reason:null,
+      recommendedAction:null
+
     };
 
-    const openAiKey = Deno.env.get("OPENAI_API_KEY");
-    if (!openAiKey || openAiKey === "your_openai_key") {
-      return jsonResponse({ error: "AI is not configured. Add OPENAI_API_KEY to the Supabase function secrets." }, 503);
+
+
+    const geminiKey =
+      Deno.env.get("GEMINI_API_KEY");
+
+
+
+    if(!geminiKey){
+
+      return jsonResponse(
+        {
+          error:
+          "AI not configured. Add GEMINI_API_KEY in Supabase secrets."
+        },
+        503
+      );
+
     }
 
-    const aiResponse = await fetch("https://api.openai.com/v1/chat/completions", {
-      method: "POST",
-      headers: { "Content-Type": "application/json", Authorization: `Bearer ${openAiKey}` },
-      body: JSON.stringify({
-        model: "gpt-4o-mini",
-        response_format: { type: "json_object" },
-        messages: [{
-          role: "user",
-          content: [
+
+
+    const parts:any[]=[
+
+      {
+
+        text:`
+
+Analyze this civic issue.
+
+${description ? "Citizen note: "+description : ""}
+
+
+Return ONLY JSON.
+
+Keys:
+
+title,
+description,
+category,
+priority,
+location,
+ward,
+reason,
+recommendedAction
+
+
+Category:
+
+${Object.keys(CATEGORY_KEYWORDS).join(", ")}, Other
+
+
+Priority:
+
+low, medium, high, urgent
+
+
+Rules:
+
+- Do not invent location.
+- Keep title short.
+- Explain reason.
+- Give one municipal action.
+
+`
+
+      }
+
+    ];
+
+
+
+    if(photoData){
+
+      parts.push({
+
+        inlineData:{
+
+          mimeType:"image/jpeg",
+
+          data:
+          photoData.replace(
+            /^data:image\/\w+;base64,/,
+            ""
+          )
+
+        }
+
+      });
+
+    }
+
+
+
+    const aiResponse = await fetch(
+
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash:generateContent?key=${geminiKey}`,
+
+      {
+
+        method:"POST",
+
+        headers:{
+          "Content-Type":"application/json"
+        },
+
+        body:JSON.stringify({
+
+          contents:[
             {
-              type: "text",
-              text: `Analyze this civic issue${photoData ? " photo" : " description"}${description ? ` and the user's note: ${description}` : ""}. Return JSON with exactly these keys: title, description, category, priority, location, ward, reason, recommendedAction. Use category from ${Object.keys(CATEGORY_KEYWORDS).join(", ")} or Other. Use priority low, medium, high, or urgent. Write a concise title and useful description. Explain the classification briefly in reason and suggest one practical municipal action. Set location or ward to null unless clearly readable. Do not invent facts.`,
-            },
-            ...(photoData ? [{ type: "image_url", image_url: { url: photoData } }] : []),
-          ],
-        }],
-      }),
-    });
-    if (!aiResponse.ok) {
-      const failure = await aiResponse.json().catch(() => null);
-      const message = failure?.error?.message || `OpenAI request failed (${aiResponse.status})`;
-      return jsonResponse({ error: message }, 502);
+              parts
+            }
+          ]
+
+        })
+
+      }
+
+    );
+
+
+
+    if(!aiResponse.ok){
+
+      const error =
+        await aiResponse.text();
+
+
+      return jsonResponse(
+        {
+          error:error
+        },
+        502
+      );
+
     }
 
-    const payload = await aiResponse.json();
-    const content = payload.choices?.[0]?.message?.content;
-    if (!content) {
-      return jsonResponse({ error: "OpenAI returned an empty suggestion" }, 502);
+
+
+    const payload =
+      await aiResponse.json();
+
+
+
+    const content =
+      payload?.candidates?.[0]?.content?.parts?.[0]?.text;
+
+
+
+    if(!content){
+
+      return jsonResponse(
+        {
+          error:"Gemini returned empty response"
+        },
+        502
+      );
+
     }
 
-    const aiResult = parseModelResult(content);
-    result = {
+
+
+    const aiResult =
+      parseJSON(content);
+
+
+
+    result={
+
       ...result,
       ...aiResult,
-      category: isCategory(aiResult.category) ? aiResult.category : result.category,
-      priority: isPriority(aiResult.priority) ? aiResult.priority : result.priority,
+
+
+      category:
+      isCategory(aiResult.category)
+      ?
+      aiResult.category
+      :
+      result.category,
+
+
+      priority:
+      isPriority(aiResult.priority)
+      ?
+      aiResult.priority
+      :
+      result.priority
+
     };
 
-    if (description && !result.description) result.description = description;
+
+
+    if(description && !result.description){
+
+      result.description=description;
+
+    }
+
+
 
     return jsonResponse(result);
-  } catch (err) {
-    return jsonResponse({ error: err instanceof Error ? err.message : "Internal error" }, 500);
+
+
+
   }
+  catch(error){
+
+    return jsonResponse(
+      {
+        error:
+        error instanceof Error
+        ?
+        error.message
+        :
+        "Internal server error"
+      },
+      500
+    );
+
+  }
+
+
 });
