@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { useNavigate } from "react-router-dom";
-import { Sparkles, Camera, MapPin, Loader2, Check } from "lucide-react";
+import { Sparkles, Camera, MapPin, Loader2, Check, ScanSearch } from "lucide-react";
 import { AppShell } from "@/components/AppShell";
 import { Card, Button, Input, Textarea, Select } from "@/components/ui";
 import { CATEGORIES, PRIORITIES, PRIORITY_LABELS } from "@/lib/constants";
@@ -8,6 +8,68 @@ import { useAuth } from "@/context/AuthContext";
 import { useToast } from "@/context/ToastContext";
 import { supabase } from "@/lib/supabase";
 import type { Priority } from "@/types";
+
+type Coordinates = { latitude: number; longitude: number };
+
+const formatCoordinates = ({ latitude, longitude }: Coordinates) =>
+  `${latitude.toFixed(5)}, ${longitude.toFixed(5)}`;
+
+// Photos from phone cameras commonly store their capture position in the JPEG EXIF
+// metadata. Read it before the image is resized for AI analysis, as canvas removes EXIF.
+const readPhotoGps = async (file: File): Promise<Coordinates | null> => {
+  if (!file.type.includes("jpeg")) return null;
+  const bytes = new DataView(await file.arrayBuffer());
+  if (bytes.getUint16(0) !== 0xffd8) return null;
+
+  let offset = 2;
+  while (offset + 4 <= bytes.byteLength) {
+    if (bytes.getUint8(offset) !== 0xff) break;
+    const marker = bytes.getUint8(offset + 1);
+    const length = bytes.getUint16(offset + 2);
+    if (marker === 0xe1 && offset + 10 + length <= bytes.byteLength &&
+      String.fromCharCode(...Array.from({ length: 4 }, (_, index) => bytes.getUint8(offset + 4 + index))) === "Exif") {
+      const tiff = offset + 10;
+      const littleEndian = bytes.getUint16(tiff) === 0x4949;
+      const uint16 = (position: number) => bytes.getUint16(position, littleEndian);
+      const uint32 = (position: number) => bytes.getUint32(position, littleEndian);
+      const readIfd = (position: number) => {
+        const entries = new Map<number, number>();
+        const count = uint16(position);
+        for (let index = 0; index < count; index += 1) {
+          const entry = position + 2 + index * 12;
+          entries.set(uint16(entry), entry);
+        }
+        return entries;
+      };
+      const ifd = readIfd(tiff + uint32(tiff + 4));
+      const gpsEntry = ifd.get(0x8825);
+      if (!gpsEntry) return null;
+      const gps = readIfd(tiff + uint32(gpsEntry + 8));
+      const latitudeEntry = gps.get(2);
+      const longitudeEntry = gps.get(4);
+      if (!latitudeEntry || !longitudeEntry) return null;
+      const readCoordinate = (entry: number) => {
+        const coordinateOffset = tiff + uint32(entry + 8);
+        const values = [0, 1, 2].map((index) => {
+          const valueOffset = coordinateOffset + index * 8;
+          const denominator = uint32(valueOffset + 4);
+          return denominator ? uint32(valueOffset) / denominator : 0;
+        });
+        return values[0] + values[1] / 60 + values[2] / 3600;
+      };
+      const latitudeRef = gps.get(1);
+      const longitudeRef = gps.get(3);
+      let latitude = readCoordinate(latitudeEntry);
+      let longitude = readCoordinate(longitudeEntry);
+      if (latitudeRef && String.fromCharCode(bytes.getUint8(latitudeRef + 8)) === "S") latitude *= -1;
+      if (longitudeRef && String.fromCharCode(bytes.getUint8(longitudeRef + 8)) === "W") longitude *= -1;
+      return Number.isFinite(latitude) && Number.isFinite(longitude) ? { latitude, longitude } : null;
+    }
+    if (length < 2) break;
+    offset += length + 2;
+  }
+  return null;
+};
 
 export default function ReportIssuePage() {
   const { profile } = useAuth();
@@ -30,6 +92,7 @@ export default function ReportIssuePage() {
   const [aiReason, setAiReason] = useState("");
   const [recommendedAction, setRecommendedAction] = useState("");
   const [gettingLocation, setGettingLocation] = useState(false);
+  const [locationSource, setLocationSource] = useState<"photo" | "device" | null>(null);
   const [submitting, setSubmitting] = useState(false);
 
   const handlePhotoUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -45,12 +108,32 @@ export default function ReportIssuePage() {
       const { data: urlData } = supabase.storage.from("issue-photos").getPublicUrl(path);
       setPhotoUrl(urlData.publicUrl);
       setPhotoData(imageData);
-      toast("Photo uploaded", "success");
+      void detectPhotoLocation(file);
+      toast("Photo uploaded — AI is detecting issue details", "success");
       await handleAISuggest(imageData);
     } catch (error) {
       toast(error instanceof Error ? error.message : "Failed to upload photo", "error");
     }
     setUploading(false);
+  };
+
+  const applyCoordinates = (coordinates: Coordinates, source: "photo" | "device") => {
+    setLatitude(coordinates.latitude);
+    setLongitude(coordinates.longitude);
+    setLocation(formatCoordinates(coordinates));
+    setLocationSource(source);
+  };
+
+  const detectPhotoLocation = async (file: File) => {
+    try {
+      const coordinates = await readPhotoGps(file);
+      if (coordinates) {
+        applyCoordinates(coordinates, "photo");
+        toast("Location detected from the photo", "success");
+      }
+    } catch {
+      // Missing or malformed EXIF is normal; the visual AI analysis can still proceed.
+    }
   };
 
   const readImageForAnalysis = (file: File) => new Promise<string>((resolve, reject) => {
@@ -98,7 +181,7 @@ export default function ReportIssuePage() {
       if (data.description) setDescription(data.description);
       if (data.category) setCategory(data.category);
       if (data.priority) setPriority(data.priority as Priority);
-      if (data.location) setLocation(data.location);
+      if (data.location && !locationSource) setLocation(data.location);
       if (data.ward) setWard(data.ward);
       if (data.reason) setAiReason(data.reason);
       if (data.recommendedAction) setRecommendedAction(data.recommendedAction);
@@ -119,9 +202,7 @@ export default function ReportIssuePage() {
     }
     navigator.geolocation.getCurrentPosition(
       (pos) => {
-        setLatitude(pos.coords.latitude);
-        setLongitude(pos.coords.longitude);
-        if (!location) setLocation(`${pos.coords.latitude.toFixed(4)}, ${pos.coords.longitude.toFixed(4)}`);
+        applyCoordinates({ latitude: pos.coords.latitude, longitude: pos.coords.longitude }, "device");
         toast("Location captured", "success");
         setGettingLocation(false);
       },
@@ -162,7 +243,7 @@ export default function ReportIssuePage() {
       <div className="mx-auto max-w-2xl">
         <div className="mb-6">
           <h1 className="text-2xl font-bold text-slate-900">Report an Issue</h1>
-          <p className="mt-1 text-sm text-slate-500">Describe the problem and our AI will suggest a category and priority.</p>
+          <p className="mt-1 text-sm text-slate-500">Upload a photo and AI will detect the issue title, category, and any visible location details.</p>
         </div>
 
         <form onSubmit={handleSubmit} className="space-y-5">
@@ -172,6 +253,11 @@ export default function ReportIssuePage() {
             {photoUrl ? (
               <div className="relative">
                 <img src={photoUrl} alt="Issue" className="w-full h-48 object-cover rounded-xl border border-slate-200" />
+                {suggesting && (
+                  <div className="absolute inset-0 flex items-center justify-center gap-2 rounded-xl bg-slate-950/55 text-sm font-semibold text-white">
+                    <ScanSearch className="h-5 w-5 animate-pulse" /> Analyzing photo with AI…
+                  </div>
+                )}
                 <button
                   type="button"
                   onClick={() => { setPhotoUrl(""); setPhotoData(""); }}
@@ -244,7 +330,7 @@ export default function ReportIssuePage() {
           </Card>
 
           <Card className="p-5 space-y-4">
-            <Input label="Location (optional)" value={location} onChange={setLocation} placeholder="e.g. Near City Mall, MG Road" />
+            <Input label="Location (optional)" value={location} onChange={(value) => { setLocation(value); setLocationSource(null); }} placeholder="e.g. Near City Mall, MG Road" />
             <Input label="Ward / Area (optional)" value={ward} onChange={setWard} placeholder="e.g. Ward 7" />
             <div>
               <button
@@ -258,7 +344,7 @@ export default function ReportIssuePage() {
               </button>
               {latitude !== null && longitude !== null && (
                 <p className="mt-1.5 text-xs text-emerald-600 flex items-center gap-1">
-                  <Check className="w-3 h-3" /> Location captured: {latitude.toFixed(4)}, {longitude.toFixed(4)}
+                  <Check className="w-3 h-3" /> Location {locationSource === "photo" ? "detected from photo" : "captured"}: {latitude.toFixed(4)}, {longitude.toFixed(4)}
                 </p>
               )}
             </div>
