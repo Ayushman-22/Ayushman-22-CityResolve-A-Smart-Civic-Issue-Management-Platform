@@ -12,6 +12,15 @@ interface SuggestRequest {
   photoData?: string | null;
 }
 
+interface GeminiPart {
+  text?: string;
+}
+
+interface GeminiResponse {
+  candidates?: Array<{ content?: { parts?: GeminiPart[] } }>;
+  error?: { message?: string };
+}
+
 const CATEGORY_KEYWORDS: Record<string, string[]> = {
   Pothole: ["pothole", "road", "crack", "asphalt", "ditch", "manhole"],
   Streetlight: ["streetlight", "lamp", "light", "dark", "flicker", "pole"],
@@ -105,260 +114,102 @@ function isPriority(value: unknown) {
 }
 
 
-function jsonResponse(
-  body: Record<string, unknown>,
-  status = 200
-) {
-
-  return new Response(
-    JSON.stringify(body),
-    {
-      status,
-      headers:{
-        ...corsHeaders,
-        "Content-Type":"application/json"
-      }
-    }
-  );
-
+function jsonResponse(body: Record<string, unknown>, status = 200) {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: { ...corsHeaders, "Content-Type": "application/json" },
+  });
 }
 
-
-function parseJSON(text:string){
-
-  const cleaned = text
-    .replace(/```json/g,"")
-    .replace(/```/g,"")
-    .trim();
-
-
-  try{
-    return JSON.parse(cleaned);
-  }
-  catch{
-    return {};
-  }
-
+function parseModelResult(content: string): Record<string, unknown> {
+  const normalized = content.trim().replace(/^```(?:json)?\s*|\s*```$/gi, "");
+  const parsed = JSON.parse(normalized) as Record<string, unknown>;
+  return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : {};
 }
 
+function photoPart(photoData: string) {
+  const match = photoData.match(/^data:([^;]+);base64,(.+)$/);
+  if (!match) throw new Error("The uploaded image could not be prepared for Gemini");
+  return { inlineData: { mimeType: match[1], data: match[2] } };
+}
 
+const responseSchema = {
+  type: "OBJECT",
+  properties: {
+    title: { type: "STRING", nullable: true },
+    description: { type: "STRING", nullable: true },
+    category: { type: "STRING" },
+    priority: { type: "STRING" },
+    location: { type: "STRING", nullable: true },
+    ward: { type: "STRING", nullable: true },
+    reason: { type: "STRING", nullable: true },
+    recommendedAction: { type: "STRING", nullable: true },
+  },
+  required: ["title", "description", "category", "priority", "location", "ward", "reason", "recommendedAction"],
+};
 
-Deno.serve(async(req)=>{
-
-  if(req.method==="OPTIONS"){
-
-    return new Response(null,{
-      status:200,
-      headers:corsHeaders
-    });
-
+Deno.serve(async (req: Request) => {
+  if (req.method === "OPTIONS") {
+    return new Response(null, { status: 200, headers: corsHeaders });
   }
 
 
-  try{
-
-
-    const {
-      description="",
-      photoData=null
-    } = await req.json() as SuggestRequest;
-
-
-
-    if(!description && !photoData){
-
-      return jsonResponse(
-        {
-          error:"Description or photo required"
-        },
-        400
-      );
-
+  try {
+    const { description = "", photoData = null } = (await req.json()) as SuggestRequest;
+    if (!description && !photoData) {
+      return jsonResponse({ error: "Description or photo is required" }, 400);
     }
 
-
-
-    let result:any={
-
-      title:null,
-      description:null,
-      category:suggestCategory(description),
-      priority:suggestPriority(description),
-      location:null,
-      ward:null,
-      reason:null,
-      recommendedAction:null
-
+    let result: Record<string, string | null> = {
+      category: suggestCategory(description),
+      priority: suggestPriority(description),
+      title: null,
+      description: null,
+      location: null,
+      ward: null,
     };
 
-
-
-    const geminiKey =
-      Deno.env.get("GEMINI_API_KEY");
-
-
-
-    if(!geminiKey){
-
-      return jsonResponse(
-        {
-          error:
-          "AI not configured. Add GEMINI_API_KEY in Supabase secrets."
-        },
-        503
-      );
-
+    const geminiApiKey = Deno.env.get("GEMINI_API_KEY");
+    if (!geminiApiKey || geminiApiKey === "your_gemini_api_key") {
+      return jsonResponse({ error: "AI is not configured. Add GEMINI_API_KEY to the Supabase function secrets." }, 503);
     }
 
-
-
-    const parts:any[]=[
-
-      {
-
-        text:`
-
-Analyze this civic issue.
-
-${description ? "Citizen note: "+description : ""}
-
-
-Return ONLY JSON.
-
-Keys:
-
-title,
-description,
-category,
-priority,
-location,
-ward,
-reason,
-recommendedAction
-
-
-Category:
-
-${Object.keys(CATEGORY_KEYWORDS).join(", ")}, Other
-
-
-Priority:
-
-low, medium, high, urgent
-
-
-Rules:
-
-- Do not invent location.
-- Keep title short.
-- Explain reason.
-- Give one municipal action.
-
-`
-
-      }
-
-    ];
-
-
-
-    if(photoData){
-
-      parts.push({
-
-        inlineData:{
-
-          mimeType:"image/jpeg",
-
-          data:
-          photoData.replace(
-            /^data:image\/\w+;base64,/,
-            ""
-          )
-
-        }
-
-      });
-
-    }
-
-
-
-    const aiResponse = await fetch(
-
-      `https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash:generateContent?key=${geminiKey}`,
-
-      {
-
-        method:"POST",
-
-        headers:{
-          "Content-Type":"application/json"
-        },
-
-        body:JSON.stringify({
-
-          contents:[
+    // gemini-2.5-flash is a stable multimodal model. Pin it instead of reading a
+    // stale GEMINI_MODEL secret such as the invalid `gemini-3-flash` identifier.
+    const model = "gemini-2.5-flash";
+    const aiResponse = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${geminiApiKey}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        contents: [{
+          role: "user",
+          parts: [
             {
-              parts
-            }
-          ]
-
-        })
-
-      }
-
-    );
-
-
-
-    if(!aiResponse.ok){
-
-      const error =
-        await aiResponse.text();
-
-
-      return jsonResponse(
-        {
-          error:error
+              text: `Analyze this civic issue${photoData ? " photo" : " description"}${description ? ` and the user's note: ${description}` : ""}. Use category from ${Object.keys(CATEGORY_KEYWORDS).join(", ")} or Other. Use priority low, medium, high, or urgent. Write a concise title and useful description. Explain the classification briefly in reason and suggest one practical municipal action. Set location or ward to null unless clearly readable. Do not invent facts.`,
+            },
+            ...(photoData ? [photoPart(photoData)] : []),
+          ],
+        }],
+        generationConfig: {
+          responseMimeType: "application/json",
+          responseSchema,
         },
-        502
-      );
-
+      }),
+    });
+    if (!aiResponse.ok) {
+      const failure = await aiResponse.json().catch(() => null) as GeminiResponse | null;
+      const message = failure?.error?.message || `Gemini request failed (${aiResponse.status})`;
+      return jsonResponse({ error: message }, 502);
     }
 
-
-
-    const payload =
-      await aiResponse.json();
-
-
-
-    const content =
-      payload?.candidates?.[0]?.content?.parts?.[0]?.text;
-
-
-
-    if(!content){
-
-      return jsonResponse(
-        {
-          error:"Gemini returned empty response"
-        },
-        502
-      );
-
+    const payload = await aiResponse.json() as GeminiResponse;
+    const content = payload.candidates?.[0]?.content?.parts?.map((part) => part.text || "").join("");
+    if (!content) {
+      return jsonResponse({ error: "Gemini returned an empty suggestion" }, 502);
     }
 
-
-
-    const aiResult =
-      parseJSON(content);
-
-
-
-    result={
-
+    const aiResult = parseModelResult(content);
+    result = {
       ...result,
       ...aiResult,
 
